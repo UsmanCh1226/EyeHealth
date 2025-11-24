@@ -1,219 +1,189 @@
 import cv2
 import dlib
-import numpy as np
+from scipy.spatial import distance as dist
 import time
-import os
-import sys
+import numpy as np
 
-# --- Configuration ---
-# Path to the dlib facial landmark predictor model
-MODEL_FILENAME = "shape_predictor_68_face_landmarks.dat"
+# --- CONSTANTS ---
 
-# Use os.path functions to create a robust, absolute path to the model file.
-# This ensures it works regardless of the current working directory.
-try:
-    # Get the directory where the current script is located
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    # Construct the full path to the shape predictor file
-    SHAPE_PREDICTOR_PATH = os.path.join(SCRIPT_DIR, MODEL_FILENAME)
-except NameError:
-    # Fallback if __file__ is not defined (e.g., in an interactive shell)
-    SHAPE_PREDICTOR_PATH = MODEL_FILENAME
-    
-# Constants for Eye Aspect Ratio (EAR)
-# Threshold for eye closure
-EYE_AR_THRESH = 0.25
-# Number of consecutive frames the EAR must be below the threshold for a blink to register
-EYE_AR_CONSEC_FRAMES = 3
+# Eye Aspect Ratio (EAR) settings for blink detection
+EAR_THRESHOLD = 0.28
+CONSECUTIVE_FRAMES = 3
 
-# Constants for Drowsiness/Alert
-# Max consecutive frames where eyes are closed to trigger alert (~3 seconds at 30 FPS)
-DROWSINESS_THRESHOLD = 50 
-TIME_FOR_REST_ALERT = 120 # Suggest a break after this many seconds (2 minutes)
+# 20-20-20 Rule settings (Set to shorter values for easy testing)
+WORK_INTERVAL_SEC = 20  # Change to 20 * 60 for 20 minutes
+REST_DURATION_SEC = 5   # Change to 20 for the full 20-second rest
 
-# --- Global State Variables ---
-COUNTER = 0
-TOTAL_BLINKS = 0
-START_TIME = time.time()
-LAST_REST_TIME = START_TIME
-ALERT_ACTIVE = False
+# Font and color settings for text display
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+TEXT_COLOR_WHITE = (255, 255, 255)
+TEXT_COLOR_GREEN = (0, 255, 0)
+TEXT_COLOR_RED = (0, 0, 255)
+ALERT_BG_COLOR = (20, 20, 20) # Dark gray background for alerts
 
-# --- Helper Functions ---
+# Dlib's facial landmark indices for the left and right eye
+# Used for calculating the Eye Aspect Ratio (EAR)
+(L_START, L_END) = (42, 48)
+(R_START, R_END) = (36, 42)
 
-def euclidean_distance(ptA, ptB):
-    """Calculates the Euclidean distance between two 2D points."""
-    return np.linalg.norm(ptA - ptB)
+# --- FUNCTIONS ---
 
 def eye_aspect_ratio(eye):
     """
-    Calculates the Eye Aspect Ratio (EAR) for a single eye.
+    Calculates the Eye Aspect Ratio (EAR) to determine if an eye is open or closed.
+    EAR = (|p2 - p6| + |p3 - p5|) / (2 * |p1 - p4|)
     """
-    # Compute the Euclidean distances between the two sets of vertical eye landmarks
-    A = euclidean_distance(eye[1], eye[5])
-    B = euclidean_distance(eye[2], eye[4])
+    # compute the euclidean distances between the two sets of
+    # vertical eye landmarks (x, y)-coordinates
+    A = dist.euclidean(eye[1], eye[5])
+    B = dist.euclidean(eye[2], eye[4])
 
-    # Compute the Euclidean distance between the horizontal eye landmarks
-    C = euclidean_distance(eye[0], eye[3])
+    # compute the euclidean distance between the horizontal
+    # eye landmarks (x, y)-coordinates
+    C = dist.euclidean(eye[0], eye[3])
 
-    # Compute the Eye Aspect Ratio
+    # compute the eye aspect ratio
     ear = (A + B) / (2.0 * C)
+
     return ear
 
-def draw_text_box(frame, text, position, font_scale=0.7, color=(0, 255, 0), thickness=2):
-    """Draws text with a background box for better visibility."""
-    (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+def draw_text_with_background(frame, text, position, font_scale, color, thickness, bg_color, padding=5):
+    """Draws text on the frame with a solid background for better visibility."""
+    (text_width, text_height), baseline = cv2.getTextSize(text, FONT, font_scale, thickness)
+    
+    # Calculate background rectangle coordinates
     x, y = position
+    pt1 = (x, y - text_height - baseline - padding)
+    pt2 = (x + text_width + padding * 2, y + padding)
     
-    # Calculate box coordinates
-    box_start = (x - 5, y - text_h - baseline - 5)
-    box_end = (x + text_w + 5, y + baseline + 5)
+    # Draw the background rectangle
+    cv2.rectangle(frame, pt1, pt2, bg_color, -1)
     
-    # Draw semi-transparent background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, box_start, box_end, (0, 0, 0), -1)
-    alpha = 0.6
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
     # Draw the text
-    cv2.putText(frame, text, (x, y - baseline), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
-    return frame
-
-# --- Main Logic ---
-
-def main():
-    global COUNTER, TOTAL_BLINKS, ALERT_ACTIVE, LAST_REST_TIME
-
-    # --- PATH FINAL CHECK ---
-    if not os.path.exists(SHAPE_PREDICTOR_PATH):
-        # If the robust path still fails, print the absolute path it tried to use.
-        print(f"\n!!! FATAL ERROR: Dlib model file not found.")
-        print(f"The script looked for the file at the ABSOLUTE path:")
-        print(f"--> {SHAPE_PREDICTOR_PATH}")
-        print("Please ensure the file is present at this location.")
-        return 
-    # --- END PATH CHECK ---
+    cv2.putText(frame, text, (x + padding, y - baseline), FONT, font_scale, color, thickness, cv2.LINE_AA)
 
 
-    # Initialize dlib's face detector and landmark predictor
-    detector = dlib.get_frontal_face_detector()
-    try:
-        # Load the predictor using the robust path
-        predictor = dlib.shape_predictor(SHAPE_PREDICTOR_PATH)
-    except RuntimeError as e:
-        print(f"Runtime Error during Dlib loading: {e}")
-        return
+# --- MAIN APPLICATION LOGIC ---
 
-    # Indices for the left and right eye points (from dlib's 68-point model)
-    (lStart, lEnd) = (42, 48) # Left eye points
-    (rStart, rEnd) = (36, 42) # Right eye points
+# initialize dlib's face detector (HOG-based) and then create
+# the facial landmark predictor
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat") # NOTE: You must have this file downloaded
 
-    cap = cv2.VideoCapture(0)
+# Initialize the video stream
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Could not open video stream.")
+    exit()
 
-    if not cap.isOpened():
-        print("Error: Could not open video stream (webcam).")
-        return
+# Blink Counters
+TOTAL_BLINKS = 0
+FRAME_COUNTER = 0
 
-    frames = 0
-    fps_start_time = time.time()
+# Time trackers for 20-20-20 rule
+start_time = time.time()
+is_resting = False
+rest_start_time = 0
+elapsed_work_time = 0
+
+# Main loop
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Flip the frame horizontally for a mirror effect
+    frame = cv2.flip(frame, 1)
     
-    print("Eye Health Monitor started. Press 'q' to quit.")
+    # Convert the frame to grayscale for face detection
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frames += 1
-        current_time = time.time()
-
-        # Calculate FPS
-        if (current_time - fps_start_time) > 1:
-            fps = frames / (current_time - fps_start_time)
-            fps_start_time = current_time
-            frames = 0
-        else:
-            try:
-                fps = frames / (current_time - fps_start_time)
-            except ZeroDivisionError:
-                fps = 0
-
-        # Convert the frame to grayscale for faster processing
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        rects = detector(gray, 0)
+    # Detect faces in the grayscale frame
+    rects = detector(gray, 0)
+    
+    # Check 20-20-20 Timer
+    if not is_resting:
+        elapsed_work_time = time.time() - start_time
+        if elapsed_work_time >= WORK_INTERVAL_SEC:
+            is_resting = True
+            rest_start_time = time.time()
+            # Stop blink counting during rest phase
         
-        ALERT_ACTIVE = False
-        status_text = "STATUS: Monitoring"
-        status_color = (0, 255, 0) # Green
+        # Display elapsed time
+        minutes = int(elapsed_work_time // 60)
+        seconds = int(elapsed_work_time % 60)
+        timer_text = f"Work Time: {minutes:02d}:{seconds:02d}"
+        draw_text_with_background(frame, timer_text, (frame.shape[1] - 220, 30), 0.7, TEXT_COLOR_WHITE, 2, ALERT_BG_COLOR, padding=3)
 
-        if len(rects) > 0:
-            rect = rects[0]
+    else:
+        # User is in the rest phase
+        elapsed_rest_time = time.time() - rest_start_time
+        remaining_rest = max(0, REST_DURATION_SEC - elapsed_rest_time)
+
+        # Display REST ALERT
+        alert_text = "20-20-20 Break! Look at least 20 feet away."
+        rest_timer_text = f"RESTING: {int(remaining_rest)}s Remaining"
+        
+        # Center the alert message on the screen
+        h, w = frame.shape[:2]
+        cv2.rectangle(frame, (0, h//2 - 100), (w, h//2 + 100), TEXT_COLOR_RED, -1)
+        
+        draw_text_with_background(frame, alert_text, (20, h//2 - 20), 1.0, TEXT_COLOR_WHITE, 2, TEXT_COLOR_RED, padding=10)
+        draw_text_with_background(frame, rest_timer_text, (20, h//2 + 50), 1.2, TEXT_COLOR_WHITE, 3, TEXT_COLOR_RED, padding=10)
+
+
+        if elapsed_rest_time >= REST_DURATION_SEC:
+            # Rest period is over, reset the timer
+            is_resting = False
+            start_time = time.time()
+            elapsed_work_time = 0 # Reset work time tracker
+
+    # Only process blinks and draw landmarks if the user is not actively resting
+    if not is_resting and len(rects) > 0:
+        for rect in rects:
+            # Determine the facial landmarks for the face region
             shape = predictor(gray, rect)
             shape = np.array([[p.x, p.y] for p in shape.parts()])
 
-            leftEye = shape[lStart:lEnd]
-            rightEye = shape[rStart:rEnd]
+            # Extract the left and right eye coordinates
+            leftEye = shape[L_START:L_END]
+            rightEye = shape[R_START:R_END]
 
+            # Compute the EAR for both eyes
             leftEAR = eye_aspect_ratio(leftEye)
             rightEAR = eye_aspect_ratio(rightEye)
-            ear = (leftEAR + rightEAR) / 2.0
 
+            # Average the eye aspect ratio together for both eyes
+            ear = (leftEAR + rightEAR) / 2.0
+            
+            # Use the convex hull to visualize the eye contours
             leftEyeHull = cv2.convexHull(leftEye)
             rightEyeHull = cv2.convexHull(rightEye)
-            cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
-            cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
+            cv2.drawContours(frame, [leftEyeHull], -1, TEXT_COLOR_GREEN, 1)
+            cv2.drawContours(frame, [rightEyeHull], -1, TEXT_COLOR_GREEN, 1)
 
-            # --- Blink and Drowsiness Detection Logic ---
-            if ear < EYE_AR_THRESH:
-                COUNTER += 1
-                if COUNTER >= DROWSINESS_THRESHOLD:
-                    ALERT_ACTIVE = True
-                    status_text = "!!! DROWSINESS ALERT !!!"
-                    status_color = (0, 0, 255) # Red
-                    
+            # Check to see if the eye aspect ratio is below the blink threshold
+            if ear < EAR_THRESHOLD:
+                FRAME_COUNTER += 1
             else:
-                if COUNTER >= EYE_AR_CONSEC_FRAMES and COUNTER < DROWSINESS_THRESHOLD:
+                # If the eyes were closed for a sufficient number of frames, increment the total number of blinks
+                if FRAME_COUNTER >= CONSECUTIVE_FRAMES:
                     TOTAL_BLINKS += 1
-                COUNTER = 0
+                
+                # Reset the frame counter
+                FRAME_COUNTER = 0
 
-            # Calculate Blink Rate (BPM)
-            elapsed_time = current_time - START_TIME
-            blink_rate = int((TOTAL_BLINKS / elapsed_time) * 60) if elapsed_time > 0 else 0
-
-            # 20-20-20 Rule Reminder
-            time_since_last_rest = current_time - LAST_REST_TIME
-            rest_suggestion_text = ""
-            if time_since_last_rest > TIME_FOR_REST_ALERT:
-                rest_suggestion_text = f"20-20-20 Rule: Break time! ({int(time_since_last_rest)}s)"
+            # Display the EAR value and Blink Counter on the frame
+            draw_text_with_background(frame, f"EAR: {ear:.2f}", (10, 30), 0.7, TEXT_COLOR_WHITE, 2, ALERT_BG_COLOR, padding=3)
+            draw_text_with_background(frame, f"Blinks: {TOTAL_BLINKS}", (10, 60), 0.7, TEXT_COLOR_WHITE, 2, ALERT_BG_COLOR, padding=3)
             
-            # --- Display Information ---
-            
-            # 1. Main Status Alert
-            frame = draw_text_box(frame, status_text, (50, 30), font_scale=0.9, color=status_color, thickness=2)
+    # Show the frame
+    cv2.imshow("Eye Monitor", frame)
 
-            # 2. Key Metrics
-            frame = draw_text_box(frame, f"EAR: {ear:.2f}", (10, frame.shape[0] - 80), color=(255, 255, 0))
-            frame = draw_text_box(frame, f"Blinks: {TOTAL_BLINKS}", (10, frame.shape[0] - 40), color=(255, 255, 0))
-            frame = draw_text_box(frame, f"BPM: {blink_rate}", (150, frame.shape[0] - 40), color=(255, 255, 0))
+    # If the 'q' key was pressed, break from the loop
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-            # 3. Rest Suggestion
-            if rest_suggestion_text:
-                 frame = draw_text_box(frame, rest_suggestion_text, (frame.shape[1] - 350, frame.shape[0] - 40), color=(0, 165, 255))
-                 
-            # 4. FPS
-            frame = draw_text_box(frame, f"FPS: {fps:.0f}", (frame.shape[1] - 80, 30), font_scale=0.6, color=(100, 100, 255))
-        
-        else:
-             status_text = "STATUS: No Face Detected"
-             frame = draw_text_box(frame, status_text, (50, 30), font_scale=0.9, color=(0, 165, 255), thickness=2)
-
-        cv2.imshow("Eye Health Monitor", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    # Cleanup
-    cap.release()
-    cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
+# Cleanup
+cv2.destroyAllWindows()
+cap.release()
