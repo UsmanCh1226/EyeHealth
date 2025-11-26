@@ -1,209 +1,295 @@
 import cv2
-import json
-import time
-import numpy as np
 import mediapipe as mp
-from scipy.spatial import distance as dist
+import numpy as np
+import time
+import csv
+import os
+import math
 
-# Local module imports
-from constants import (
-    EAR_THRESHOLD, MAR_THRESHOLD, DIST_THRESHOLD_CM,
-    LOGGING_INTERVAL_SEC, LOG_FILE_PATH, CALIBRATION_FILE_PATH,
-    FONT, TEXT_COLOR_GREEN, TEXT_COLOR_RED, TEXT_COLOR_YELLOW,
-    ALERT_BG_COLOR, NORMAL_BG_COLOR,
-    L_START, L_END, R_START, R_END, MOUTH_TOP, MOUTH_BOTTOM,
-    KNOWN_FACE_WIDTH_CM
-)
-from utils import (
-    eye_aspect_ratio, mouth_aspect_ratio,
-    calculate_distance, draw_text_with_background
-)
-from logger import EyeHealthLogger
+# --- Configuration and Constants ---
 
-# --- Global State Variables ---
-BLINK_COUNTER = 0
-TOTAL_BLINKS = 0
-YAWN_COUNTER = 0
-TOTAL_YAWNS = 0
-IS_DROWSY = False
-IS_TOO_CLOSE = False
+# Standard camera settings for distance calculation (needs to be calibrated)
+# FOCAL_LENGTH is the distance of the user's face from the camera (in the units you measured for calibration)
+# This value is read from the calibration file, but we use a default if the file is missing.
+DEFAULT_FOCAL_LENGTH = 1720.45 
 
-# Load Focal Length from Calibration
-try:
-    with open(CALIBRATION_FILE_PATH, 'r') as f:
-        CALIBRATION_DATA = json.load(f)
-        FOCAL_LENGTH = CALIBRATION_DATA.get('FocalLength', 0.0)
-    print(f"Loaded Focal Length: {FOCAL_LENGTH}")
-except FileNotFoundError:
-    print(f"Calibration file not found at {CALIBRATION_FILE_PATH}. Please run calibration.py first.")
-    # Exit here if FOCAL_LENGTH is absolutely necessary
-    # For robust production code, we might set FOCAL_LENGTH = 1.0 and prompt calibration.
-    # For now, we'll exit as intended by the previous logic.
-    exit()
+# Target distance in mm (e.g., a healthy viewing distance)
+TARGET_DISTANCE_MM = 500  
 
-# Initialize MediaPipe Face Mesh
+# Thresholds in mm (e.g., alert if closer than 400mm or farther than 700mm)
+TOO_CLOSE_MM = 400
+TOO_FAR_MM = 700
+
+# File paths
+CALIBRATION_FILE = "calibration.txt"
+LOG_FILE = "eye_monitoring_log.csv"
+
+# Time interval for logging data (in seconds)
+LOG_INTERVAL_SEC = 5
+
+# MediaPipe setup
 mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    min_detection_confidence=0.5
-)
+mp_drawing = mp.solutions.drawing_utils
+drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
 
-# Initialize Camera and Logger
-cap = cv2.VideoCapture(0)
-health_logger = EyeHealthLogger(LOG_FILE_PATH, LOGGING_INTERVAL_SEC)
-start_time = time.time()
-last_log_time = start_time
+# --- Landmark Indices for Face Mesh (Based on MediaPipe documentation) ---
+# We use specific landmarks to measure the distance in 3D space
+# Standard points for a robust 3D head distance measurement:
+# 152: Nose tip (front)
+# 454: Right ear/cheek side
+# 234: Left ear/cheek side
+# 199: Chin/Mouth center
+# 1: Forehead/Top center
 
-def get_landmarks(image):
-    """Processes the image and returns a list of normalized landmarks."""
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(image)
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+# Indices for the eyes (used for drawing/status, not primary distance calc)
+RIGHT_EYE_INDICES = [33, 7, 163, 144, 145, 153, 154, 155, 133, 246]
+LEFT_EYE_INDICES = [362, 382, 381, 380, 374, 390, 249, 263, 373, 374]
 
-    if results.multi_face_landmarks:
-        h, w, _ = image.shape
-        # Scale normalized landmarks (0-1) to pixel coordinates (0-W, 0-H)
-        landmarks = [(int(lm.x * w), int(lm.y * h)) for lm in results.multi_face_landmarks[0].landmark]
-        return landmarks, image
-    return None, image
+# Indices for key points used in 3D distance calculation (from the front of the face)
+FRONT_FACE_LANDMARKS = [10, 152, 234, 454] 
 
-def main_loop():
-    global BLINK_COUNTER, TOTAL_BLINKS, YAWN_COUNTER, TOTAL_YAWNS, IS_DROWSY, IS_TOO_CLOSE
-    global last_log_time, start_time
 
-    while cap.isOpened():
-        success, image = cap.read()
-        if not success:
-            print("Ignoring empty camera frame.")
-            continue
+# --- Helper Functions ---
 
-        landmarks, image = get_landmarks(image)
-        current_time = time.time()
+def load_calibration():
+    """Loads the focal length from a calibration file."""
+    focal_length = DEFAULT_FOCAL_LENGTH
+    try:
+        if os.path.exists(CALIBRATION_FILE):
+            with open(CALIBRATION_FILE, 'r') as f:
+                line = f.readline().strip()
+                focal_length = float(line)
+        print(f"Calibration loaded: Focal Length = {focal_length:.2f}")
+    except Exception as e:
+        print(f"Warning: Could not load calibration file. Using default. Error: {e}")
+    return focal_length
+
+def initialize_log():
+    """Initializes the CSV log file with headers."""
+    # Check if file exists to avoid writing headers multiple times
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                'Timestamp', 
+                'Distance_MM', 
+                'Status', 
+                'Recommended_Distance_MM',
+                'Raw_3D_Face_Width_Pixels'
+            ])
+    print(f"Log file initialized: {LOG_FILE}")
+
+def log_data(distance_mm, status, face_width_px):
+    """Writes the current data to the CSV log file."""
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    
+    with open(LOG_FILE, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            timestamp, 
+            f"{distance_mm:.2f}", 
+            status, 
+            TARGET_DISTANCE_MM, 
+            f"{face_width_px:.2f}"
+        ])
+
+def calculate_distance(landmarks, frame_w, focal_length):
+    """
+    Calculates the distance from the camera based on face width in pixels (P)
+    using the perspective formula: D = (W * F) / P
+    
+    W (Actual Width) is the known actual distance between the two points in mm.
+    F (Focal Length) is the calibrated focal length in pixels.
+    P (Pixel Width) is the measured pixel distance between the two points on the frame.
+    """
+    
+    # We use the distance between the two side cheek landmarks (234 and 454) as a reference.
+    # Typical adult face width (W) at this reference point is approximately 140 mm.
+    # This value is a standard estimate and should be validated through calibration.
+    KNOWN_FACE_WIDTH_MM = 140.0
+
+    # Get the coordinates of the two key side points
+    p1 = landmarks[234] 
+    p2 = landmarks[454]
+
+    # Calculate the pixel distance (P) between these two points
+    # First convert normalized coordinates (0 to 1) to actual pixel coordinates
+    p1_px = (int(p1.x * frame_w), int(p1.y * frame_w))
+    p2_px = (int(p2.x * frame_w), int(p2.y * frame_w))
+
+    # Calculate the Euclidean distance in pixels
+    pixel_width = math.sqrt((p2_px[0] - p1_px[0])**2 + (p2_px[1] - p1_px[1])**2)
+    
+    if pixel_width > 0:
+        # Distance (D) in mm = (KNOWN_FACE_WIDTH_MM * FOCAL_LENGTH) / pixel_width
+        distance_mm = (KNOWN_FACE_WIDTH_MM * focal_length) / pixel_width
+    else:
+        distance_mm = 0
         
-        # Initialize distance in case no face is detected
-        current_distance_cm = 0.0
+    return distance_mm, pixel_width
 
-        if landmarks:
-            # --- 1. Eye Aspect Ratio (EAR) for Drowsiness/Blinking ---
+# --- Main Monitoring Function ---
+
+def start_monitoring():
+    """Initializes and runs the eye monitoring application."""
+    
+    # Load settings and initialize logging
+    focal_length = load_calibration()
+    initialize_log()
+    
+    # Timing for log interval
+    last_log_time = time.time()
+
+    # Video Capture Setup
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open video stream.")
+        return
+
+    print("Monitoring started. Press 'q' to exit.")
+
+    # MediaPipe Face Mesh Pipeline
+    with mp_face_mesh.FaceMesh(
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5) as face_mesh:
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
             
-            # Get the indices of the points needed for the calculation (simplified 6 points)
-            # Left Eye: 362, 385, 380, 373, 386, 263
-            l_eye_coords = np.array([landmarks[i] for i in [362, 385, 380, 373, 386, 263]])
-            # Right Eye: 133, 160, 158, 153, 144, 33
-            r_eye_coords = np.array([landmarks[i] for i in [133, 160, 158, 153, 144, 33]])
+            if not ret:
+                print("Ignoring empty camera frame.")
+                break
 
-            # Calculate EARs
-            left_ear = eye_aspect_ratio(l_eye_coords)
-            right_ear = eye_aspect_ratio(r_eye_coords)
-            avg_ear = (left_ear + right_ear) / 2.0
-
-            # Blink Detection Logic
-            if avg_ear < EAR_THRESHOLD:
-                BLINK_COUNTER += 1
-            else:
-                if BLINK_COUNTER > 1: # Require more than 1 frame closure to count as a blink
-                    TOTAL_BLINKS += 1
-                BLINK_COUNTER = 0
-
-            # Drowsiness check (sustained low EAR)
-            # 30 frames is roughly 1 second at 30 FPS
-            if BLINK_COUNTER > 30: 
-                IS_DROWSY = True
-            else:
-                IS_DROWSY = False
-
-
-            # --- 2. Mouth Aspect Ratio (MAR) for Yawning ---
-            mouth_coords = np.array([landmarks[i] for i in [MOUTH_TOP, MOUTH_BOTTOM, 61, 291]]) # Indices: 13 (top), 14 (bottom), 61 (left), 291 (right)
-            mar = mouth_aspect_ratio(mouth_coords)
-
-            if mar > MAR_THRESHOLD:
-                YAWN_COUNTER += 1
-            else:
-                # Only register a yawn if mouth was open for a sustained period
-                if YAWN_COUNTER > 10: 
-                    TOTAL_YAWNS += 1
-                YAWN_COUNTER = 0
-
-
-            # --- 3. Distance Calculation (Proximity Alert) ---
-            # Indices 234 and 454 define the rough horizontal width of the face/head
-            face_pixel_width = dist.euclidean(landmarks[234], landmarks[454])
-            current_distance_cm = calculate_distance(FOCAL_LENGTH, KNOWN_FACE_WIDTH_CM, face_pixel_width)
-
-            if current_distance_cm < DIST_THRESHOLD_CM:
-                IS_TOO_CLOSE = True
-            else:
-                IS_TOO_CLOSE = False
-
-            # --- 4. Drawing Metrics & Alerts ---
+            # Flip the image horizontally for a natural selfie-view display
+            frame = cv2.flip(frame, 1) 
             
-            # Distance Display
-            distance_text = f"Distance: {current_distance_cm:.1f} cm"
-            if IS_TOO_CLOSE:
-                image = draw_text_with_background(image, distance_text, (20, 50), FONT, 0.7, TEXT_COLOR_RED, ALERT_BG_COLOR)
-                alert_text = f"TOO CLOSE! Maintain distance > {DIST_THRESHOLD_CM:.0f} cm."
-                image = draw_text_with_background(image, alert_text, (20, 90), FONT, 0.9, TEXT_COLOR_RED, ALERT_BG_COLOR, thickness=2)
-            else:
-                image = draw_text_with_background(image, distance_text, (20, 50), FONT, 0.7, TEXT_COLOR_GREEN, NORMAL_BG_COLOR)
-
-            # Eye and Yawn Metrics Display
-            blink_text = f"Total Blinks: {TOTAL_BLINKS}"
-            yawn_text = f"Total Yawns: {TOTAL_YAWNS}"
-            ear_text = f"EAR: {avg_ear:.2f}"
-
-            image = draw_text_with_background(image, blink_text, (20, 130), FONT, 0.6, TEXT_COLOR_WHITE, NORMAL_BG_COLOR)
-            image = draw_text_with_background(image, yawn_text, (20, 160), FONT, 0.6, TEXT_COLOR_WHITE, NORMAL_BG_COLOR)
-            image = draw_text_with_background(image, ear_text, (20, 190), FONT, 0.6, TEXT_COLOR_WHITE, NORMAL_BG_COLOR)
-
-            # Drowsiness Alert
-            if IS_DROWSY:
-                drowsy_alert = "DROWSINESS DETECTED! Rest eyes."
-                image = draw_text_with_background(image, drowsy_alert, (20, 230), FONT, 0.9, TEXT_COLOR_YELLOW, ALERT_BG_COLOR, thickness=2)
-
-            # Draw landmarks for visualization
-            # Note: R_START and L_START are just start indices, using the calculated eye/mouth points is more precise
-            for point in l_eye_coords:
-                cv2.circle(image, tuple(point.astype(int)), 1, (0, 255, 0), -1)
-            for point in r_eye_coords:
-                cv2.circle(image, tuple(point.astype(int)), 1, (0, 255, 0), -1)
-            for point in mouth_coords:
-                cv2.circle(image, tuple(point.astype(int)), 1, (0, 255, 255), -1)
-
-
-        # --- 5. Logging Logic ---
-        if current_time - last_log_time >= LOGGING_INTERVAL_SEC:
-            # Calculate Blinks Per Minute (BPM)
-            duration_minutes = (current_time - start_time) / 60.0
+            # Convert the BGR image to RGB before processing
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Handle potential division by zero if start_time was just reset
-            total_blinks_bpm = TOTAL_BLINKS / duration_minutes if duration_minutes > 0 else 0 
+            # CRITICAL FIX LOCATION: Define h and w *inside* the loop
+            h, w, _ = frame.shape
+            
+            # Process the frame
+            results = face_mesh.process(rgb_frame)
 
-            # Log the data
-            health_logger.log_metrics(
-                total_blinks_bpm=total_blinks_bpm,
-                current_distance_cm=current_distance_cm,
-                is_drowsy=IS_DROWSY,
-                is_too_close=IS_TOO_CLOSE,
-                yawn_count=TOTAL_YAWNS
+            # Initialize variables for the loop iteration
+            distance_mm = 0.0
+            face_width_px = 0.0
+            status_text = "Searching for Face..."
+            status_color = (0, 0, 255) # Red (Default: Searching)
+            
+            # --- Processing Landmarks ---
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    
+                    # Calculate distance
+                    distance_mm, face_width_px = calculate_distance(
+                        face_landmarks.landmark, 
+                        w, 
+                        focal_length
+                    )
+                    
+                    # Determine Status
+                    if distance_mm < TOO_CLOSE_MM and distance_mm > 0:
+                        status_text = "TOO CLOSE! (Distance: {:.0f}mm)".format(distance_mm)
+                        status_color = (0, 0, 255)  # Red
+                    elif distance_mm > TOO_FAR_MM:
+                        status_text = "TOO FAR! (Distance: {:.0f}mm)".format(distance_mm)
+                        status_color = (0, 255, 255) # Yellow
+                    elif distance_mm > 0:
+                        status_text = "OPTIMAL DISTANCE ({:.0f}mm)".format(distance_mm)
+                        status_color = (0, 255, 0) # Green
+                    else:
+                        status_text = "Searching for Face..."
+                        status_color = (128, 128, 128) # Grey
+
+                    # Draw face mesh (optional, can be removed for cleaner look)
+                    # mp_drawing.draw_landmarks(
+                    #     frame,
+                    #     face_landmarks,
+                    #     mp_face_mesh.FACEMESH_TESSELATION,
+                    #     drawing_spec,
+                    #     drawing_spec
+                    # )
+                    
+                    # Draw a bounding box around the face for clarity
+                    # We can use the center landmarks to draw a box relative to the detected face width
+                    center_x = int((face_landmarks.landmark[168].x + face_landmarks.landmark[401].x) / 2 * w)
+                    center_y = int((face_landmarks.landmark[10].y + face_landmarks.landmark[152].y) / 2 * h)
+                    
+                    box_size = int(face_width_px * 0.7) # A bit smaller than the face
+                    
+                    cv2.rectangle(
+                        frame,
+                        (center_x - box_size, center_y - box_size),
+                        (center_x + box_size, center_y + box_size),
+                        status_color,
+                        2
+                    )
+
+            # --- Drawing UI/Stats (The UnboundLocalError Fix) ---
+            # These variables now use h and w which are defined on lines 288/289
+            
+            # Background box for statistics in the lower left corner
+            stats_bg_x = 10
+            stats_bg_y = h - 130  # CRITICAL: This now uses 'h' which is defined
+            stats_bg_w = 400
+            stats_bg_h = 120
+            
+            # Draw the background rectangle
+            cv2.rectangle(
+                frame,
+                (stats_bg_x, stats_bg_y),
+                (stats_bg_x + stats_bg_w, stats_bg_y + stats_bg_h),
+                (30, 30, 30), # Dark Grey background
+                -1
             )
+            
+            # Title
+            cv2.putText(frame, "Eye Distance Monitor", (stats_bg_x + 10, stats_bg_y + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            # Status line
+            cv2.putText(frame, "STATUS: " + status_text.split('(')[0].strip(), 
+                        (stats_bg_x + 10, stats_bg_y + 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+                        
+            # Distance line
+            display_dist = "N/A"
+            if distance_mm > 0:
+                display_dist = f"{distance_mm:.0f} mm"
+            cv2.putText(frame, "Current Distance: " + display_dist, 
+                        (stats_bg_x + 10, stats_bg_y + 95),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
 
-            # Reset counts for the next logging interval
-            TOTAL_BLINKS = 0
-            TOTAL_YAWNS = 0
-            start_time = current_time # Start fresh timing for the next calculation
-            last_log_time = current_time
+            # --- Logging Logic ---
+            current_time = time.time()
+            if current_time - last_log_time >= LOG_INTERVAL_SEC and distance_mm > 0:
+                log_data(distance_mm, status_text.split('(')[0].strip(), face_width_px)
+                last_log_time = current_time
 
-        cv2.imshow('Eye Health Monitor', image)
+            # Display the resulting frame
+            cv2.imshow('Eye Monitoring System', frame)
+            
+            # Exit condition
+            if cv2.waitKey(5) & 0xFF == ord('q'):
+                break
 
-        # Break loop with 'q' key
-        if cv2.waitKey(5) & 0xFF == ord('q'):
-            break
-
-    # Cleanup
+    # Release resources
     cap.release()
     cv2.destroyAllWindows()
+    print("Monitoring stopped and resources released.")
 
 if __name__ == '__main__':
-    main_loop()
+    # Ensure calibration file exists with a default value if not present
+    if not os.path.exists(CALIBRATION_FILE):
+        try:
+             with open(CALIBRATION_FILE, 'w') as f:
+                f.write(str(DEFAULT_FOCAL_LENGTH))
+             print(f"Created default {CALIBRATION_FILE} with focal length {DEFAULT_FOCAL_LENGTH}")
+        except Exception as e:
+            print(f"Error creating default calibration file: {e}")
+
+    start_monitoring()
