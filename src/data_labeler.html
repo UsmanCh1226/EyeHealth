@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ocular Data Labeler</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for minimalist look */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0d1117; /* Dark, minimalist background */
+            color: #c9d1d9; /* Light text */
+        }
+        .card {
+            background-color: #161b22; /* Slightly lighter card background */
+            border: 1px solid #30363d;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .btn-primary {
+            background-color: #238636;
+            transition: background-color 0.2s;
+        }
+        .btn-primary:hover {
+            background-color: #2ea043;
+        }
+        /* Hide the default file input for custom styling */
+        #image-upload {
+            display: none;
+        }
+        /* Custom scrollbar for minimalist terminals/data views */
+        .data-view::-webkit-scrollbar {
+            width: 6px;
+        }
+        .data-view::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 3px;
+        }
+        .data-view::-webkit-scrollbar-track {
+            background: #161b22;
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-8">
+    <div class="max-w-6xl mx-auto">
+        
+        <!-- Header -->
+        <header class="text-center mb-8 p-4 card rounded-lg">
+            <h1 class="text-3xl font-bold text-green-400">Ocular Image Annotation Workbench</h1>
+            <p class="text-gray-400 mt-1">Prepare datasets for machine learning model training.</p>
+        </header>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            
+            <!-- Left Column: Image Preview and Upload -->
+            <div class="lg:col-span-2 space-y-6">
+                <div class="card p-6 rounded-lg h-full">
+                    <h2 class="text-xl font-semibold mb-4 border-b border-[#30363d] pb-2 text-green-300">Retinal Image Preview</h2>
+                    
+                    <!-- Image Display Area -->
+                    <div id="image-container" class="aspect-video bg-[#0d1117] border border-dashed border-gray-600 rounded-lg flex items-center justify-center mb-4 overflow-hidden h-96">
+                        <span id="placeholder-text" class="text-gray-500 text-center p-4">
+                            Upload a retinal fundus image (.jpg, .png) to begin labeling.
+                        </span>
+                        <img id="retina-image" class="hidden w-full h-full object-contain" alt="Retinal Image for Labeling">
+                    </div>
+
+                    <!-- Upload Button -->
+                    <label for="image-upload" class="w-full text-center py-2 px-4 rounded-lg cursor-pointer font-medium btn-primary block">
+                        Upload Image
+                    </label>
+                    <input type="file" id="image-upload" accept="image/*" onchange="handleImageUpload(event)">
+                    <p id="file-name-display" class="text-sm text-gray-500 mt-2 text-center"></p>
+
+                </div>
+            </div>
+
+            <!-- Right Column: Labeling Controls and Data View -->
+            <div class="lg:col-span-1 space-y-6">
+                
+                <!-- Labeling Controls -->
+                <div class="card p-6 rounded-lg">
+                    <h2 class="text-xl font-semibold mb-4 border-b border-[#30363d] pb-2 text-green-300">Labeling Controls</h2>
+                    
+                    <div class="mb-4">
+                        <label for="label-select" class="block text-sm font-medium mb-2">Select Primary Diagnosis:</label>
+                        <select id="label-select" class="w-full p-2 rounded bg-[#0d1117] border border-gray-600 focus:ring-green-500 focus:border-green-500">
+                            <option value="Unlabeled">-- Select Label --</option>
+                            <option value="Healthy">Healthy Retina</option>
+                            <option value="Mild_DR">Mild Diabetic Retinopathy</option>
+                            <option value="Severe_DR">Severe Diabetic Retinopathy</option>
+                            <option value="Glaucoma">Glaucomatous Damage</option>
+                            <option value="AMD">Age-related Macular Degeneration</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-4">
+                        <label for="notes-input" class="block text-sm font-medium mb-2">Annotation Notes:</label>
+                        <textarea id="notes-input" rows="3" class="w-full p-2 rounded bg-[#0d1117] border border-gray-600 focus:ring-green-500 focus:border-green-500" placeholder="e.g., Microaneurysms detected in superior temporal quadrant."></textarea>
+                    </div>
+                    
+                    <button onclick="saveAnnotation()" id="save-btn" class="w-full py-2 px-4 rounded-lg font-semibold btn-primary disabled:bg-gray-600 disabled:text-gray-400 disabled:cursor-not-allowed" disabled>
+                        Save Annotation
+                    </button>
+                    <div id="status-message" class="text-center mt-2 text-sm hidden"></div>
+                </div>
+
+                <!-- Data View (Simulated) -->
+                <div class="card p-6 rounded-lg">
+                    <h2 class="text-xl font-semibold mb-4 border-b border-[#30363d] pb-2 text-green-300">Annotated Data Log</h2>
+                    <div id="data-log" class="data-view h-64 overflow-y-auto p-2 text-sm bg-[#0d1117] rounded border border-gray-700 space-y-2">
+                        <!-- Log entries will appear here -->
+                        <p class="text-gray-500 italic text-center">No data saved yet.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        let currentImageFileName = null;
+        const retinaImage = document.getElementById('retina-image');
+        const placeholderText = document.getElementById('placeholder-text');
+        const saveButton = document.getElementById('save-btn');
+        const statusMessage = document.getElementById('status-message');
+        const dataLog = document.getElementById('data-log');
+
+        // Function to handle file upload
+        function handleImageUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            if (!file.type.startsWith('image/')) {
+                displayStatus("Please upload a valid image file.", 'red');
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                retinaImage.src = e.target.result;
+                retinaImage.classList.remove('hidden');
+                placeholderText.classList.add('hidden');
+                currentImageFileName = file.name;
+                document.getElementById('file-name-display').textContent = currentImageFileName;
+                saveButton.disabled = false;
+                displayStatus("Image loaded.", 'green');
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // Function to save the current annotation
+        function saveAnnotation() {
+            if (!currentImageFileName) {
+                displayStatus("Please upload an image first.", 'red');
+                return;
+            }
+
+            const label = document.getElementById('label-select').value;
+            const notes = document.getElementById('notes-input').value.trim();
+
+            if (label === 'Unlabeled') {
+                displayStatus("Please select a primary diagnosis label.", 'red');
+                return;
+            }
+
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = {
+                timestamp: timestamp,
+                file: currentImageFileName,
+                label: label,
+                notes: notes || 'No specific notes recorded.'
+            };
+
+            // Simulate saving to a data log (In a real app, this would be an API call to a database/server)
+            console.log("Saved Annotation:", logEntry);
+            
+            // Update the Data Log view
+            appendLogEntry(logEntry);
+            
+            // Reset controls and notify user
+            document.getElementById('label-select').value = 'Unlabeled';
+            document.getElementById('notes-input').value = '';
+            displayStatus(`Annotation saved for ${currentImageFileName}.`, 'green');
+        }
+
+        // Function to display temporary status messages
+        function displayStatus(message, color) {
+            statusMessage.textContent = message;
+            statusMessage.className = `text-center mt-2 text-sm font-medium block p-2 rounded bg-${color}-900/50 text-${color}-300`;
+            statusMessage.classList.remove('hidden');
+            setTimeout(() => {
+                statusMessage.classList.add('hidden');
+            }, 3000);
+        }
+        
+        // Function to add a new entry to the visual log
+        function appendLogEntry(entry) {
+            if (dataLog.querySelector('.italic')) {
+                dataLog.innerHTML = ''; // Clear placeholder if it exists
+            }
+            
+            const entryDiv = document.createElement('div');
+            entryDiv.className = 'p-3 rounded bg-gray-700/50 border border-green-500/50 transition duration-150 ease-in-out hover:bg-gray-600/50';
+            entryDiv.innerHTML = `
+                <div class="flex justify-between text-xs text-gray-400 border-b border-gray-700 pb-1 mb-1">
+                    <span>${entry.timestamp}</span>
+                    <span class="font-mono text-green-300">${entry.label}</span>
+                </div>
+                <p class="font-medium truncate">${entry.file}</p>
+                <p class="text-xs text-gray-500 mt-1 italic">${entry.notes}</p>
+            `;
+            dataLog.prepend(entryDiv); // Add to the top
+        }
+
+    </script>
+</body>
+</html>

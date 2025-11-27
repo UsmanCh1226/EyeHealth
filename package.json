@@ -1,0 +1,10 @@
+{
+  "name": "gemini-vision-simulator",
+  "version": "1.0.0",
+  "description": "Node.js script to simulate the Retina Analysis API call.",
+  "main": "simulate_analysis.js",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
