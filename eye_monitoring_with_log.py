@@ -292,4 +292,8 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"Error creating default calibration file: {e}")
 
+<<<<<<< HEAD
     start_monitoring()
+=======
+    start_monitoring()
+>>>>>>> 8b51a21e0bba80a34cfbe030a8ec59ff159d9213

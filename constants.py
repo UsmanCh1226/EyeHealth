@@ -32,4 +32,8 @@ R_START, R_END = 133, 33
 
 # Mouth landmarks for MAR calculation
 MOUTH_TOP = 13     # Top lip (Center)
+<<<<<<< HEAD
 MOUTH_BOTTOM = 14  # Bottom lip (Center)
+=======
+MOUTH_BOTTOM = 14  # Bottom lip (Center)
+>>>>>>> 8b51a21e0bba80a34cfbe030a8ec59ff159d9213
