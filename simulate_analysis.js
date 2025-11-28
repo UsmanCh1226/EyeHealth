@@ -4,7 +4,7 @@ import fetch from 'node-fetch';
 
 // --- CONFIGURATION ---
 // !! REPLACE WITH YOUR ACTUAL API KEY !!
-const API_KEY = "AIzaSyCMoWnnwzcWXH60EQdoAEFfUal1Tk-U3as"; 
+const API_KEY = process.env.AIzaSyCW9_RevrRynbZAUOfJuUWuJ-EGJcLz2bw; 
 const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
 const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}`;
 const IMAGE_FILE_PATH = 'retina_scan.jpeg'; // **UPDATED to .jpeg**
